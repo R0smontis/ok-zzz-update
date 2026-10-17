@@ -1,0 +1,190 @@
+# -*- coding: utf-8 -*-
+# 移植自 ZenlessZoneZero-OneDragon (GPL-3.0)
+# 来源: https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon
+# 路径: zzz_od/operation/transport.py
+# 本文件随 ok-zzz 以 GPL-3.0 继续分发。
+import time
+from typing import ClassVar
+
+from cv2.typing import MatLike
+
+from onedragon.base.operation.operation_edge import node_from
+from onedragon.base.operation.operation_node import operation_node
+from onedragon.base.operation.operation_round_result import OperationRoundResult
+from onedragon.utils import str_utils
+from onedragon.utils.i18_utils import gt
+from zzz_od.context.zzz_context import ZContext
+from zzz_od.operation.back_to_normal_world import BackToNormalWorld
+from zzz_od.operation.map_transport import MapTransport
+from zzz_od.operation.zzz_operation import ZOperation
+
+
+class Transport(ZOperation):
+
+    STATUS_NOT_IN_MAP: ClassVar[str] = '未在地图页面'
+    MAP_OPEN_TIMEOUT_SECONDS: ClassVar[float] = 30
+
+    def __init__(self, ctx: ZContext, area_name: str, tp_name: str, wait_at_last: bool = True):
+        """
+        传送到某个区域
+        由于使用了返回大世界 应可保证在任何情况下使用
+        :param ctx:
+        :param area_name:
+        :param tp_name:
+        :param wait_at_last: 最后等待大世界加载
+        """
+        ZOperation.__init__(self, ctx,
+                            op_name='%s %s %s' % (
+                                gt('传送'),
+                                gt(area_name, 'game'),
+                                gt(tp_name, 'game')
+                            ))
+
+        self.area_name: str = area_name
+        self.tp_name: str = tp_name
+        self.wait_at_last: bool = wait_at_last
+
+    @operation_node(name='画面识别', is_start_node=True)
+    def check_screen(self) -> OperationRoundResult:
+        """
+        画面识别
+        :return:
+        """
+        if self.is_map_screen(self.last_screenshot):
+            return self.round_success()
+        else:
+            return self.round_success(status=Transport.STATUS_NOT_IN_MAP)
+
+    @node_from(from_name='画面识别', status=STATUS_NOT_IN_MAP)
+    @operation_node(name='返回大世界')
+    def back_to_world(self) -> OperationRoundResult:
+        op = BackToNormalWorld(self.ctx)
+        return self.round_by_op_result(op.execute())
+
+    @node_from(from_name='返回大世界')
+    @operation_node(name='打开地图')
+    def open_map(self) -> OperationRoundResult:
+        """
+        在大世界画面 点击
+        :return:
+        """
+        if self.is_map_screen(self.last_screenshot):
+            return self.round_success()
+
+        if getattr(self.ctx.controller, 'background_mode', False):
+            return self._open_map_by_gamepad()
+
+        result = self.round_by_find_and_click_area(self.last_screenshot, '大世界', '地图')
+        if result.is_success:
+            return self.round_wait(status=result.status, wait=2)
+        else:
+            return self.round_retry(status=result.status, wait=1)
+
+    def _open_map_by_gamepad(self) -> OperationRoundResult:
+        """后台用手柄打开地图，直到实际出现地图画面。
+
+        按键可能只被游戏用来切换输入设备而不生效（游戏停在键鼠模式）；2026-10-12 实机中
+        一次运行开始后约 20 秒内的 9 次按键都没有打开地图（未能复现原因），所以按时间而非
+        按键次数限定重试。
+        """
+        now = time.monotonic()
+        started = getattr(self, '_map_open_started', None)
+        if started is None:
+            started = self._map_open_started = now
+        if now - started >= Transport.MAP_OPEN_TIMEOUT_SECONDS:
+            return self.round_fail('手柄打开地图未生效')
+        # A map that is still opening must not be toggled shut: press only on a verified world frame.
+        worlds = ('大世界-普通', '大世界-勘域')
+        if self.check_and_update_current_screen(self.last_screenshot, screen_name_list=list(worlds)) not in worlds:
+            return self.round_wait('等待地图或大世界画面，未操作', wait=1)
+        keys = self.ctx.game_config.get_gamepad_action_keys().get('minimap', [])
+        if not keys:
+            return self.round_fail('未配置手柄地图按键')
+        requests = getattr(self, '_map_open_requests', 0)
+        if requests:
+            # The last press changed nothing; the game may have consumed it to switch input devices.
+            self.ctx.controller.forget_game_input_mode()
+        for key in keys:
+            self.ctx.controller.btn_press(key, press_time=.12)
+        self._map_open_requests = requests + 1
+        return self.round_wait('手柄打开地图，等待实际地图画面', wait=2)
+
+    @node_from(from_name='打开地图')
+    @node_from(from_name='画面识别')
+    @operation_node(name='执行传送')
+    def do_transport(self) -> OperationRoundResult:
+        """
+        已在地图画面，调用 MapTransport 执行传送
+        :return:
+        """
+        if getattr(self.ctx.controller, 'background_mode', False):
+            from src.navigation.map import ICON_POINTS, leave_quick_nav, quick_nav
+            if not getattr(self, '_icon_fallback', False):
+                # 快捷导航 lists every daily point by name (verified 2026-10-12); searching the map
+                # for icons failed when zooming hid 吼吼饼铺.
+                result = quick_nav(self, self.last_screenshot)
+                if result.is_fail and self.tp_name in ICON_POINTS and '没有传送点' in str(result.status):
+                    self._icon_fallback = True
+                    return self.round_wait(f'{result.status}，改用地图图标', wait=.3)
+                return result
+            leaving = leave_quick_nav(self, self.last_screenshot)
+            if leaving is not None:
+                return leaving
+        op = MapTransport(self.ctx, self.area_name, self.tp_name)
+        return self.round_by_op_result(op.execute())
+
+    @node_from(from_name='执行传送')
+    @operation_node(name='等待大世界加载')
+    def wait_in_world(self) -> OperationRoundResult:
+        if not self.wait_at_last:
+            return self.round_success('不等待大世界加载')
+        op = BackToNormalWorld(self.ctx)  # 传送落地可能触发好感度事件 使用BackToNormalWorld可以处理
+        return self.round_by_op_result(op.execute())
+
+    def is_map_screen(self, screen: MatLike) -> bool:
+        """
+        当前画面是否在地图选择画面
+        要同时出现多个地区名称和传送点名称
+        :param screen: 游戏画面
+        :return:
+        """
+        if getattr(self.ctx.controller, 'background_mode', False):
+            from src.navigation.map import map_state
+            if map_state(self, screen) is not None:
+                return True
+        area_name_list: list[str] = []
+        tp_name_list: list[str] = []
+
+        for area in self.ctx.map_service.area_list:
+            area_name_list.append(gt(area.area_name, 'game'))
+            for tp in area.tp_list:
+                tp_name_list.append(gt(tp, 'game'))
+
+        area_name_cnt: int = 0
+        tp_name_cnt: int = 0
+        ocr_result_map = self.ctx.ocr.run_ocr(screen)
+        for ocr_result, mrl in ocr_result_map.items():
+            area_idx: int = str_utils.find_best_match_by_difflib(ocr_result, area_name_list)
+            if area_idx is not None and area_idx >= 0:
+                area_name_cnt += 1
+            tp_idx: int = str_utils.find_best_match_by_difflib(ocr_result, tp_name_list)
+            if tp_idx is not None and tp_idx >= 0:
+                tp_name_cnt += 1
+
+        # 增加判断条件，左上角返回
+        result = self.round_by_find_area(screen, '地图', '左上角返回')
+
+        return area_name_cnt >= 3 and tp_name_cnt >= 1 and result.is_success
+
+
+def __debug():
+    ctx = ZContext()
+    ctx.init_by_config()
+    ctx.init_ocr()
+    ctx.run_context.start_running()
+    op = Transport(ctx, '澄辉坪', '阿朔')
+    op.execute()
+
+
+if __name__ == '__main__':
+    __debug()

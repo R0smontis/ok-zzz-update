@@ -1,0 +1,416 @@
+# -*- coding: utf-8 -*-
+# 移植自 ZenlessZoneZero-OneDragon (GPL-3.0)
+# 来源: https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon
+# 路径: zzz_od/operation/back_to_normal_world.py
+# 本文件随 ok-zzz 以 GPL-3.0 继续分发。
+from cv2.typing import MatLike
+
+from onedragon.base.operation.operation_edge import node_from
+from onedragon.base.operation.operation_node import operation_node
+from onedragon.base.operation.operation_round_result import OperationRoundResult
+from onedragon.utils import cv2_utils, str_utils
+from onedragon.utils.i18_utils import gt
+from zzz_od.context.zzz_context import ZContext
+from zzz_od.game_data.agent import AgentEnum
+from zzz_od.hollow_zero.event import hollow_event_utils
+from zzz_od.hollow_zero.hollow_exit_by_menu import HollowExitByMenu
+from zzz_od.operation.map_transport import MapTransport
+from zzz_od.operation.zzz_operation import ZOperation
+from src.controls.gamepad import press as pad
+
+
+class BackToNormalWorld(ZOperation):
+
+    def __init__(self, ctx: ZContext, ensure_normal_world: bool = False, allow_battle: bool = False):
+        """
+        需要保证在任何情况下调用，都能返回大世界，让后续的应用可执行
+
+        Args:
+            ctx (ZContext): 上下文
+            ensure_normal_world (bool): 是否回到普通大世界
+            allow_battle (bool): 是否允许在战斗状态直接返回成功（锄大地传送后用，让调用方处理战斗）。
+                启用时调用方必须处理返回的 status='大世界-战斗'，否则角色将卡在战斗画面。
+        """
+        ZOperation.__init__(self, ctx, op_name=gt('返回大世界'),timeout_seconds=90)
+
+        self.ensure_normal_world: bool = ensure_normal_world  # 是否回到普通大世界
+        self.allow_battle: bool = allow_battle  # 是否允许战斗状态直接返回
+        self.handle_init()
+
+    def handle_init(self) -> None:
+        self.last_dialog_idx: int = -1  # 上次选择的对话选项下标
+        self.click_exit_battle: bool = False  # 是否点击了退出战斗
+        self.prefer_dialog_confirm: bool = False  # 第一次优先取消，后续确认/取消轮流点击
+        self._background_menu_back = 0
+        self._normal_arrival_waits = 0
+        for key in tuple(self.__dict__):
+            if key.startswith(('_map_open_', '_quick_nav_')):
+                self.__dict__.pop(key, None)
+        self._exit_confirm_sent = False
+        self._escaping = False
+        for key in ('_pad_escape_menu', '_pad_escape_sent', '_pad_grid_steps', '_pad_grid_reveal',
+                    '_pad_menu_steps', '_pad_menu_confirms'):
+            self.__dict__.pop(key, None)
+
+    @node_from(from_name='执行传送')
+    @node_from(from_name='执行传送', success=False)
+    @node_from(from_name='确认脱离卡死', success=False)
+    @operation_node(name='画面识别', is_start_node=True, node_max_retry_times=60)
+    def check_screen_and_run(self) -> OperationRoundResult:
+        """
+        识别游戏画面
+        :return:
+        """
+        screen_name_list = ['大世界-普通', '大世界-勘域']
+        current_screen = self.check_and_update_current_screen()
+        if current_screen in screen_name_list:
+            self.click_exit_battle = False
+            self._exit_confirm_sent = False
+            if current_screen == '大世界-勘域':
+                already_transport = self.previous_node.name == '执行传送' and self.previous_node.is_success
+                if self.ensure_normal_world:
+                    if already_transport and getattr(self.ctx.controller, 'background_mode', False):
+                        self._normal_arrival_waits += 1
+                        if self._normal_arrival_waits > 6:
+                            return self.round_fail('确认传送后仍在勘域，未核验返回普通大世界')
+                        return self.round_wait('等待录像店加载，未把勘域算作普通大世界', wait=1)
+                    if not already_transport:
+                        return self.round_success('传送到录像店')
+
+            return self.round_success(status=current_screen)
+
+        # 退出菜单/确认和战斗 HUD 必须先于通用返回、路径导航和小地图兜底。
+        # 否则 B 会取消退出确认，小地图也会把仍在特殊模式的角色误当作已返回。
+        if getattr(self, '_escaping', False) and getattr(self.ctx.controller, 'background_mode', False):
+            from src.navigation.menus import escape_stuck
+            return escape_stuck(self, self.last_screenshot)
+
+        battle_result = self._handle_battle_exit()
+        if battle_result is not None:
+            return battle_result
+
+        if getattr(self.ctx.controller, 'background_mode', False):
+            from src.navigation.menus import lost_void_gateway_visible
+            # This gamepad gateway has a top-left back icon and no textual
+            # footer. A mouse click on that icon does not operate this menu.
+            if lost_void_gateway_visible(self, self.last_screenshot):
+                if self._background_menu_back >= 6:
+                    return self.round_fail('深层调查入口返回未生效')
+                pad(self.ctx, 'b')
+                self._background_menu_back += 1
+                return self.round_retry('手柄离开已核验的深层调查入口，等待实际画面', wait=1)
+            from src.navigation.map import return_from_map
+            map_result = return_from_map(self, self.last_screenshot)
+            if map_result is not None:
+                return map_result
+            from onedragon.base.geometry.rectangle import Rect
+            popup_rows=self.ctx.ocr_service.get_ocr_result_list(image=self.last_screenshot,rect=Rect(650,450,1300,750))
+            popup_words=[str(r.data).strip().replace(' ','') for r in popup_rows] if isinstance(popup_rows,(list,tuple)) else []
+            if any(any(label in w for label in ('生意兴隆','诚信经营','丁尼为本')) for w in popup_words) and '确认' in popup_words:
+                requests=getattr(self,'_background_menu_back',0)
+                if requests>=6:
+                    return self.round_fail('营业结果确认未关闭')
+                pad(self.ctx, 'a')
+                self._background_menu_back=requests+1
+                return self.round_retry('确认已开始营业的结果，等待实际菜单',wait=1)
+            # 获得 popup (e.g. food after 实战模拟室): A only on a verified focused 确认; 前往 would leave elsewhere.
+            from src.navigation.menus import label_focused
+            obtained_rows=self.ctx.ocr_service.get_ocr_result_list(image=self.last_screenshot,rect=Rect(600,380,1320,760))
+            obtained_rows=obtained_rows if isinstance(obtained_rows,(list,tuple)) else []
+            confirm=next((r for r in obtained_rows if str(r.data).strip()=='确认'),None)
+            if confirm is not None and any(str(r.data).strip()=='获得' for r in obtained_rows):
+                requests=getattr(self,'_background_menu_back',0)
+                if requests>=6:
+                    return self.round_fail('获得弹窗确认未关闭')
+                self._background_menu_back=requests+1
+                if label_focused(self.last_screenshot,confirm.center):
+                    pad(self.ctx, 'a')
+                    return self.round_retry('确认获得弹窗，等待实际画面',wait=1)
+                pad(self.ctx, 'dpad_right')
+                return self.round_retry('手柄移到获得弹窗的确认，等待实际焦点',wait=.6)
+            rows = self.ctx.ocr_service.get_ocr_result_list(image=self.last_screenshot, rect=Rect(600, 850, 1920, 1060))
+            words = [str(r.data).strip().replace(' ', '') for r in rows] if isinstance(rows, (list, tuple)) else []
+            # The bakery's main screen only shows Y/A actions; B still returns
+            # to the street. Require both bakery-specific labels before using B.
+            bakery_menu = (any('选择盲盒' in word or '已领取同类型奖励' in word for word in words)
+                           and any('集卡兑换' in word for word in words))
+            main_menu = len(set(words) & {'设置','公告','成就','绳网','仓库','代理人','商城','丽都城募','调频'}) >= 5
+            battle_result = '完成' in words and '再来一次' in words  # B is 完成 on the result screen.
+            # Screens such as 实战模拟室 ignore window-message clicks on their top-left back icon; B works.
+            if ('返回' in words or bakery_menu or main_menu or battle_result
+                    or self.round_by_find_area(self.last_screenshot, '画面-通用', '返回').is_success):
+                requests = getattr(self, '_background_menu_back', 0)
+                if requests >= 6:
+                    return self.round_fail('手柄返回大世界未生效，当前菜单仍显示返回')
+                pad(self.ctx, 'b')
+                self._background_menu_back = requests + 1
+                return self.round_retry('手柄返回，等待实际大世界画面', wait=1)
+
+        result = self.round_by_goto_screen(screen=self.last_screenshot, screen_name='大世界-普通', retry_wait=None)
+        if result.is_success:
+            return self.round_success(result.status)
+        if (getattr(self.ctx.controller, 'background_mode', False)
+                and current_screen is not None and current_screen.startswith('快捷手册') and result.is_fail):
+            return result
+
+        if (not result.is_fail  # fail是没有路径可以到达
+                and self.ctx.screen_loader.current_screen_name is not None):
+            return self.round_wait(result.status, wait=1)
+
+        mini_map = self.ctx.world_patrol_service.cut_mini_map(self.last_screenshot)
+        if mini_map.play_mask_found:
+            if self.ensure_normal_world:
+                return self.round_success('传送到录像店')
+            return self.round_success(status='发现地图')
+
+        if getattr(self.ctx.controller, 'background_mode', False):
+            return self._back_by_gamepad()
+
+        # 大部分画面都有街区或勘域可以直接返回，“区域”通过 0.5 LCS 匹配“街区”的“区”或“勘域”的“域”
+        result = self.round_by_find_and_click_area(self.last_screenshot, '画面-通用', '左上角-区域')
+        if result.is_success:
+            return self.round_retry(result.status, wait=1)
+
+
+
+        # 战斗菜单-脱离卡死（大世界-勘域不慎进入战斗状态时使用）
+        result = self.round_by_find_and_click_area(self.last_screenshot, '战斗-菜单', '按钮-脱离卡死')
+        if result.is_success:
+            return self.round_success('脱离卡死', wait=1)
+
+        # 通用返回按钮（识别点击型）
+        # 需要在"完成"前面，否则在丽都城募app（若购买了大月卡）会误点击“已完成购买” issue #2005
+        result = self.round_by_find_and_click_area(self.last_screenshot, '画面-通用', '返回')
+        if result.is_success:
+            return self.round_retry(result.status, wait=1)
+
+        # 部分画面有关闭按钮
+        result = self.round_by_find_and_click_area(self.last_screenshot, '画面-通用', '关闭')
+        if result.is_success:
+            return self.round_retry(result.status, wait=1)
+
+        # 通用完成按钮
+        result = self.round_by_find_and_click_area(self.last_screenshot, '画面-通用', '完成')
+        if result.is_success:
+            return self.round_retry(result.status, wait=1)
+
+        # 在空洞内
+        result = hollow_event_utils.check_in_hollow(self.ctx, self.last_screenshot)
+        if result is not None:
+            op = HollowExitByMenu(self.ctx)
+            op.execute()
+            return self.round_retry(result, wait=1)
+
+        # 通用对话框：确认/取消轮流优先点击，避免卡在只点一种按钮
+        first_area = '对话框确认' if self.prefer_dialog_confirm else '对话框取消'
+        second_area = '对话框取消' if self.prefer_dialog_confirm else '对话框确认'
+        result = self.round_by_find_and_click_area(self.last_screenshot, '大世界', first_area)
+        if result.is_success:
+            self.prefer_dialog_confirm = not self.prefer_dialog_confirm
+            return self.round_retry(result.status, wait=1)
+        result = self.round_by_find_and_click_area(self.last_screenshot, '大世界', second_area)
+        if result.is_success:
+            self.prefer_dialog_confirm = not self.prefer_dialog_confirm
+            return self.round_retry(result.status, wait=1)
+
+        # 这是领取完活跃度奖励的情况
+        result = self.check_compendium(self.last_screenshot)
+        if result is not None:
+            return self.round_retry(result.status, wait=1)
+
+        # 判断是否有好感度事件
+        if self._check_agent_dialog(self.last_screenshot):
+            return self._handle_agent_dialog(self.last_screenshot)
+
+
+        # 通用返回按钮（兜底点击型）
+        # 区域位于左上角的红色返回按钮，不进行识别，相当于点击空白区域，故不能提前使用
+        click_back = self.round_by_click_area('画面-通用', '返回')
+        if click_back.is_success:
+            # 由于上方识别可能耗时较长
+            # 这样就可能 当前截图是没加载的 耗时识别后加载好 但点击了返回
+            # 那如果使用wait_round_time=1的话 可能导致点击后基本不等待
+            # 进入下一轮截图就会识别到在大世界 但因为点击了返回又到了菜单
+            # 相关 issue #1357
+            return self.round_retry(click_back.status, wait=0.5)
+        else:
+            return self.round_fail()
+
+    def _handle_battle_exit(self) -> OperationRoundResult | None:
+        screen = self.last_screenshot
+        background = getattr(self.ctx.controller, 'background_mode', False)
+        if getattr(self, 'click_exit_battle', False):
+            if background:
+                from onedragon.base.geometry.rectangle import Rect
+                from src.navigation.menus import label_focused
+                rows = self.ctx.ocr_service.get_ocr_result_list(image=screen, rect=Rect(600, 380, 1320, 760))
+                rows = rows if isinstance(rows, (list, tuple)) else []
+                confirm = next((r for r in rows if str(r.data).strip() == '确认'), None)
+                cancel = next((r for r in rows if str(r.data).strip() == '取消'), None)
+                if confirm is not None:
+                    if getattr(self, '_exit_confirm_sent', False):
+                        return self.round_retry('等待退出确认关闭，未重复按键', wait=.5)
+                    if label_focused(screen, confirm.center):
+                        pad(self.ctx, 'a')
+                        self._exit_confirm_sent = True
+                        return self.round_retry('手柄确认退出，等待实际画面', wait=1)
+                    if cancel is not None and label_focused(screen, cancel.center):
+                        pad(self.ctx, 'dpad_right' if confirm.center.x > cancel.center.x else 'dpad_left')
+                        return self.round_retry('选择退出确认，等待实际焦点', wait=.5)
+                    return self.round_retry('未核验退出确认焦点，未操作', wait=.5)
+                if not getattr(self, '_exit_confirm_sent', False):
+                    return self.round_retry('等待退出确认文字，未操作', wait=.5)
+            else:
+                result = self.round_by_find_and_click_area(screen, '战斗-菜单', '按钮-退出战斗-确认')
+                if result.is_success:
+                    return self.round_retry(result.status, wait=1)
+            self.click_exit_battle = False
+            self._exit_confirm_sent = False
+
+        if background:
+            from onedragon.base.geometry.rectangle import Rect
+            from src.navigation.menus import press_labelled
+            button = press_labelled(self, screen, '退出战斗', Rect(0, 0, 1920, 1080))
+            if button:
+                self.click_exit_battle = True
+                return self.round_retry(f'手柄退出战斗（{button.upper()}），等待确认画面', wait=1)
+        else:
+            result = self.round_by_find_and_click_area(screen, '战斗-菜单', '按钮-退出战斗')
+            if result.is_success:
+                self.click_exit_battle = True
+                return self.round_retry(result.status, wait=1)
+
+        result = self.round_by_find_area(screen, '战斗画面', '按键-普通攻击')
+        if result.is_success:
+            if getattr(self, 'allow_battle', False):
+                return self.round_success(status='大世界-战斗')
+            if background:
+                # 菜单图标不接受窗口消息；手柄经主菜单「更多 → 脱离卡死」离开战斗。
+                from src.navigation.menus import escape_stuck
+                self._escaping = True
+                return escape_stuck(self, screen)
+            self.round_by_click_area('战斗画面', '菜单')
+            return self.round_retry(result.status, wait=.5)
+        return None
+
+    def _back_by_gamepad(self) -> OperationRoundResult:
+        """Controller fallback: the click fallbacks below report success while the game ignores them."""
+        from onedragon.base.geometry.rectangle import Rect
+        from src.navigation.menus import press_labelled
+        screen = self.last_screenshot
+        # Result screens show their actual controller button glyph.
+        for label in ('退出', '完成'):
+            button = press_labelled(self, screen, label, Rect(1300, 960, 1920, 1080))
+            if button:
+                return self.round_retry(f'手柄{label}（{button.upper()}），等待实际画面', wait=1)
+        result = hollow_event_utils.check_in_hollow(self.ctx, screen)
+        if result is not None:
+            HollowExitByMenu(self.ctx).execute()
+            return self.round_retry(result, wait=1)
+        # Unknown menu or popup: B backs out of nearly every game screen.
+        pad(self.ctx, 'b')
+        return self.round_retry('未知画面，手柄返回', wait=1)
+
+    @node_from(from_name='画面识别', status='脱离卡死')
+    @operation_node(name='确认脱离卡死')
+    def confirm_escape_stuck(self) -> OperationRoundResult:
+        """确认脱离卡死"""
+        return self.round_by_find_and_click_area(self.last_screenshot, '战斗-菜单', '按钮-脱离卡死-确认', retry_wait=0.5)
+
+    @node_from(from_name='画面识别', status='传送到录像店')
+    @node_from(from_name='确认脱离卡死')
+    @operation_node(name='打开地图', node_max_retry_times=60)
+    def open_map(self) -> OperationRoundResult:
+        """脱离卡死后，识别到大世界立即点击地图按钮"""
+        if getattr(self.ctx.controller, 'background_mode', False):
+            from src.navigation.map import map_state, quick_nav_state
+            if map_state(self, self.last_screenshot) is not None or quick_nav_state(self, self.last_screenshot) is not None:
+                return self.round_success('已核验地图画面')
+            from zzz_od.operation.transport import Transport
+            return Transport._open_map_by_gamepad(self)
+        return self.round_by_find_and_click_area(self.last_screenshot, '大世界', '地图', retry_wait=0.5)
+
+    @node_from(from_name='打开地图')
+    @operation_node(name='执行传送')
+    def do_transport(self) -> OperationRoundResult:
+        """打开地图后，传送到录像店房间"""
+        if getattr(self.ctx.controller, 'background_mode', False):
+            from src.navigation.map import quick_nav
+            self.area_name, self.tp_name = '录像店', '房间'
+            return quick_nav(self, self.last_screenshot)
+        op = MapTransport(self.ctx, '录像店', '房间')
+        return self.round_by_op_result(op.execute())
+
+    def _check_agent_dialog(self, screen: MatLike) -> bool:
+        """
+        识别是否有代理人好感度对话
+        """
+        area = self.ctx.screen_loader.get_area('大世界', '好感度标题')
+        ocr_result_list = self.ctx.ocr_service.get_ocr_result_list(
+            image=screen,
+            rect=area.rect,
+        )
+        ocr_word_list: list[str] = [i.data for i in ocr_result_list]
+        agent_name_list = [i.value.agent_name for i in AgentEnum] + ['小黑']
+        agent_name_list = [gt(i, 'game') for i in agent_name_list]
+        idx1, idx2 = str_utils.find_most_similar(ocr_word_list, agent_name_list)
+        return idx1 is not None and idx2 is not None
+
+    def _handle_agent_dialog(self, screen: MatLike) -> OperationRoundResult | None:
+        """
+        处理代理人好感度对话
+        """
+        area = self.ctx.screen_loader.get_area('大世界', '好感度选项')
+        ocr_result_map = self.ctx.ocr.crop_and_run_ocr(screen, area.rect)
+        if len(ocr_result_map) > 0:
+            self.last_dialog_idx = 1  # 每次都换一个选项 防止错误识别点击了不是选项的地方
+            if self.last_dialog_idx >= len(ocr_result_map):  # 下标过大 从0开始
+                self.last_dialog_idx = 0
+
+            current_idx = -1
+            for ocr_result, mrl in ocr_result_map.items():
+                current_idx += 1
+                if current_idx == self.last_dialog_idx:
+                    self.ctx.controller.click(mrl.max.center + area.left_top)
+                    return self.round_wait(ocr_result, wait=1)
+        else:
+            self.round_by_click_area('菜单', '返回')
+            return self.round_wait('对话无选项', wait=1)
+
+        return None
+
+    def check_compendium(self, screen: MatLike) -> OperationRoundResult | None:
+        """
+        判断是否在快捷手册
+        """
+        area = self.ctx.screen_loader.get_area('快捷手册', 'TAB列表')
+
+        tab_list = self.ctx.compendium_service.data.tab_list
+        target_word_list = [gt(i.tab_name, 'game') for i in tab_list]
+        tab_num: int = 0
+
+        ocr_result_list = self.ctx.ocr_service.get_ocr_result_list(
+            image=screen,
+            rect=area.rect,
+        )
+        for mr in ocr_result_list:
+            idx = str_utils.find_best_match_by_difflib(mr.data, target_word_list)
+            if idx is not None and idx >= 0:
+                tab_num += 1
+
+        if tab_num >= 2:  # 找到了多个tab
+            return self.round_by_click_area('快捷手册', '按钮-退出')
+
+        return None
+
+
+def _debug() -> None:
+    ctx = ZContext()
+    ctx.init()
+    ctx.run_context.start_running()
+    op = BackToNormalWorld(ctx)
+    op.execute()
+
+
+if __name__ == '__main__':
+    _debug()
